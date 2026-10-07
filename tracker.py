@@ -11,8 +11,8 @@ WATCHLIST = [
     ("Cyber-shot", 5000),
     ("Coolpix", 5000),
     ("Ryzen 5 3600", 5000),
-    ("Mechanical Keyboard", 2000)
-    ("Digital Camera", 5000)
+    ("Mechanical Keyboard", 2000),
+    ("Digital Camera", 5000),
     ("DSLR", 5000)
 ]
 
