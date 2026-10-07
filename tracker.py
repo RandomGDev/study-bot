@@ -13,7 +13,8 @@ WATCHLIST = [
     ("Ryzen 5 3600", 5000),
     ("Mechanical Keyboard", 2000),
     ("Digital Camera", 5000),
-    ("DSLR", 5000)
+    ("DSLR", 5000),
+    ("Power supply", 1750)
 ]
 
 DELHI_LOCATION_ID = "1000001"
