@@ -1,0 +1,38 @@
+name: OLX Deal Cron
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'  # Automatically runs every 20 minutes
+  workflow_dispatch:        # Allows manual trigger button
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: pip install requests
+
+      - name: Run OLX Tracker
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python tracker.py
+
+      - name: Commit Updated Seen Ads
+        run: |
+          git config --global user.name "deal-bot"
+          git config --global user.email "bot@users.noreply.github.com"
+          git add seen_ads.json || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "update seen ads" && git push)
+          
