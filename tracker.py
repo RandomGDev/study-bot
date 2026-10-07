@@ -53,6 +53,7 @@ def send_alert(title, price, ad_id, loc_name):
 def main():
     seen_ads = load_seen()
     new_found = False
+    send_alert("⚡ TEST ALERT", 999, "test-item", "System Online")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
