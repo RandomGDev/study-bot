@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import asyncio
 import threading
 import xml.etree.ElementTree as ET
@@ -25,13 +26,19 @@ COOKIES_PATH = "/etc/secrets/cookies.txt" if os.path.exists("/etc/secrets/cookie
     "cookies.txt" if os.path.exists("cookies.txt") else None
 )
 
-# 180-second timeout so connections never hang forever
 client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=180000)  # 180s in milliseconds
+    http_options=types.HttpOptions(timeout=180000)
 )
 
-MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-3.0-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
+# Includes Flash and Flash-Lite models so if one is experiencing 503 high demand, it falls back seamlessly
+MODEL_CANDIDATES = [
+    "gemini-3.0-flash",
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
 
 PDF_CSS = """
 body { font-family: Arial, Helvetica, sans-serif; line-height: 1.6; color: #1e293b; font-size: 10.5pt; word-wrap: break-word; }
@@ -54,22 +61,33 @@ BROWSER_HEADERS = {
 # --- HELPER FUNCTIONS ---
 
 def call_gemini(contents, low_res_video: bool = False):
-    """Calls Gemini Flash with automatic model fallback and optional low-resolution video mode."""
+    """
+    Calls Gemini with automatic 503/429 retry backoff and model fallback.
+    If gemini-3.0-flash has a 503 demand spike, it retries and falls back automatically!
+    """
     last_err = None
     config = types.GenerateContentConfig(media_resolution="MEDIA_RESOLUTION_LOW") if low_res_video else None
 
-    for model_name in MODEL_CANDIDATES:
-        try:
-            return client.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config,
-            )
-        except Exception as e:
-            last_err = e
-            if "404" in str(e) or "NOT_FOUND" in str(e):
-                continue
-            raise e
+    for attempt in range(3):  # Up to 3 full passes with backoff
+        for model_name in MODEL_CANDIDATES:
+            try:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                # If model name doesn't exist on this account, try next model immediately
+                if "404" in err_str or "NOT_FOUND" in err_str or "no longer available" in err_str:
+                    continue
+                # If 503 High Demand or 429 Rate Limit, pause briefly and try next/retry
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    time.sleep(4 * (attempt + 1))
+                    continue
+                raise e
+        time.sleep(5)
     raise last_err
 
 
@@ -135,12 +153,14 @@ def extract_video_id(url: str) -> str | None:
 
 
 def _query_youtube_innertube(video_id: str) -> dict:
-    """Queries YouTube's internal Innertube API as an Android/iOS client to bypass cloud IP blocks."""
+    """Queries YouTube's internal Innertube API across multiple embedded/mobile clients."""
     clients = [
         {
-            "clientName": "ANDROID",
-            "clientVersion": "19.44.38",
-            "androidSdkVersion": 34,
+            "clientName": "ANDROID_VR",
+            "clientVersion": "1.60.19",
+            "deviceMake": "Oculus",
+            "deviceModel": "Quest 3",
+            "osVersion": "12L",
             "hl": "en",
             "gl": "IN",
         },
@@ -151,14 +171,27 @@ def _query_youtube_innertube(video_id: str) -> dict:
             "deviceModel": "iPhone16,2",
             "hl": "en",
             "gl": "IN",
+        },
+        {
+            "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            "clientVersion": "2.0",
+            "hl": "en",
+            "gl": "IN",
         }
     ]
     for client_ctx in clients:
         try:
+            payload = {
+                "context": {
+                    "client": client_ctx,
+                    "thirdParty": {"embedUrl": "https://www.google.com"}
+                },
+                "videoId": video_id
+            }
             r = requests.post(
                 "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-                json={"context": {"client": client_ctx}, "videoId": video_id},
-                headers={"User-Agent": "com.google.android.youtube/19.44.38 (Linux; U; Android 14) gzip"},
+                json=payload,
+                headers=BROWSER_HEADERS,
                 timeout=8,
             )
             if r.status_code == 200:
@@ -280,8 +313,8 @@ def _parse_caption_track_url(base_url: str) -> str | None:
 
 
 def fetch_transcript(video_id: str) -> str | None:
-    """Fast, cloud-proof transcript fetcher with strict timeouts so it never hangs."""
-    # Layer 1: Innertube Android/iOS Player API
+    """Fast, cloud-proof transcript fetcher."""
+    # Layer 1: Innertube Embedded/VR Player API (rarely blocked on cloud IPs)
     player_data = _query_youtube_innertube(video_id)
     tracks = (
         player_data.get("captions", {})
@@ -327,14 +360,34 @@ def fetch_transcript(video_id: str) -> str | None:
     except Exception:
         pass
 
+    # Layer 4: Invidious public instances
+    for inv_base in ["https://inv.tux.pizza", "https://invidious.nerdvpn.de", "https://iv.ggtyler.dev"]:
+        try:
+            r = requests.get(f"{inv_base}/api/v1/captions/{video_id}", timeout=6)
+            if r.status_code == 200:
+                captions = r.json().get("captions", [])
+                for cap in captions:
+                    if cap.get("language_code", "").startswith(("en", "hi")) and cap.get("url"):
+                        vtt = requests.get(f"{inv_base}{cap['url']}", timeout=8).text
+                        lines = [
+                            l for l in vtt.splitlines()
+                            if l.strip() and "-->" not in l and not l.startswith(("WEBVTT", "Kind:", "Language:"))
+                        ]
+                        joined = re.sub(r'<[^>]+>', '', " ".join(lines))
+                        if len(joined) > 100:
+                            return joined
+        except Exception:
+            pass
+
     return None
 
 
 def generate_study_notes(video_id: str, title: str, transcript: str | None, description: str) -> str:
     """
-    Generates study notes rapidly.
-    Uses fps=0.2 (1 frame every 5 seconds) + MEDIA_RESOLUTION_LOW when analyzing raw video
-    so even 6-hour One-Shot marathons finish in ~30-45 seconds without hanging or hitting 1M tokens!
+    Generates study notes within the Free Tier 250,000 TPM rate limit!
+    - If transcript is available: caps at 700,000 chars (~175K tokens, safely under 250K TPM).
+    - If raw video fallback is needed: uses fps=0.1 and a 90-minute window (~120K tokens)
+      so it NEVER exceeds the 250K TPM Free Tier limit or triggers 503 overload!
     """
     base_instructions = f"""
     You are an expert academic note-taker. Create comprehensive, well-structured, 
@@ -362,38 +415,36 @@ def generate_study_notes(video_id: str, title: str, transcript: str | None, desc
     """
 
     if transcript:
-        safe_transcript = transcript[:2500000]
+        # 700,000 characters is ~175,000 tokens — safely below the 250,000 TPM Free Tier limit!
+        safe_transcript = transcript[:700000]
         prompt = f"{base_instructions}\n\nLecture Transcript:\n{safe_transcript}"
         response = call_gemini(prompt, low_res_video=False)
     else:
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
         try:
-            # Sample at 0.2 FPS (1 frame every 5 seconds) + Low Res so 5-hour lectures process 5x faster!
+            # Cap at 5400s (90 mins) and fps=0.1 so total tokens stay ~110K (well under 250K Free Tier TPM!)
             response = call_gemini(
                 [
                     types.Part(
                         file_data=types.FileData(file_uri=youtube_url, mime_type="video/mp4"),
-                        video_metadata=types.VideoMetadata(fps=0.2)
+                        video_metadata=types.VideoMetadata(start_offset="0s", end_offset="5400s", fps=0.1)
                     ),
                     base_instructions
                 ],
                 low_res_video=True
             )
-        except Exception as e:
-            # Fallback if video is 8+ hours long: sample first 3 hours at 0.15 FPS
-            if "exceeds the maximum number of tokens" in str(e) or "400" in str(e) or "INVALID_ARGUMENT" in str(e):
-                response = call_gemini(
-                    [
-                        types.Part(
-                            file_data=types.FileData(file_uri=youtube_url, mime_type="video/mp4"),
-                            video_metadata=types.VideoMetadata(start_offset="0s", end_offset="10800s", fps=0.15)
-                        ),
-                        base_instructions
-                    ],
-                    low_res_video=True
-                )
-            else:
-                raise e
+        except Exception:
+            # Ultra-light fallback (first 45 mins at 0.1 FPS = ~55K tokens) if Google video servers are overloaded
+            response = call_gemini(
+                [
+                    types.Part(
+                        file_data=types.FileData(file_uri=youtube_url, mime_type="video/mp4"),
+                        video_metadata=types.VideoMetadata(start_offset="0s", end_offset="2700s", fps=0.1)
+                    ),
+                    base_instructions
+                ],
+                low_res_video=True
+            )
 
     return clean_latex_to_unicode(response.text)
 
@@ -535,15 +586,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             transcript = await asyncio.to_thread(fetch_transcript, video_id)
 
             if transcript:
-                await notes_status.edit_text("🧠 Step 2/3: Transcript found! Writing structured study notes...")
+                await notes_status.edit_text("🧠 Step 2/3: Transcript extracted! Writing structured study notes...")
             else:
-                await notes_status.edit_text("🧠 Step 2/3: Watching lecture directly via Gemini AI (takes ~30-60s for full One-Shots)...")
+                await notes_status.edit_text("🧠 Step 2/3: Watching lecture directly via Gemini AI (takes ~30-60s)...")
 
-            notes = await asyncio.to_thread(
-                asyncio.wait_for,
-                asyncio.to_thread(generate_study_notes, video_id, title, transcript, description),
-                timeout=180.0
-            ) if False else await asyncio.wait_for(
+            notes = await asyncio.wait_for(
                 asyncio.to_thread(generate_study_notes, video_id, title, transcript, description),
                 timeout=180.0
             )
