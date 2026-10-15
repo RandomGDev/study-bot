@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -19,12 +20,17 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_KEY")
 
+# Optional: If you ever add a Secret File named cookies.txt in Render, it will auto-use it
+COOKIES_PATH = "/etc/secrets/cookies.txt" if os.path.exists("/etc/secrets/cookies.txt") else (
+    "cookies.txt" if os.path.exists("cookies.txt") else None
+)
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Uses gemini-3.8-flash first, with automatic fallback if needed
-MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
+# Uses your working model first, with automatic fallbacks
+MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
 
-# Clean styling for the generated PDF notes (supports Unicode symbols & prevents right-edge cutoff)
+# Clean styling for the generated PDF notes
 PDF_CSS = """
 body { font-family: Arial, Helvetica, sans-serif; line-height: 1.6; color: #1e293b; font-size: 10.5pt; word-wrap: break-word; }
 h1 { color: #1e3a8a; border-bottom: 2px solid #1e3a8a; padding-bottom: 6px; margin-top: 0; font-size: 18pt; }
@@ -37,11 +43,16 @@ li { margin-bottom: 6px; }
 p { margin-bottom: 8px; }
 """
 
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 # --- HELPER FUNCTIONS ---
 
 def call_gemini(contents):
-    """Calls Gemini 3.8 Flash with automatic fallback."""
+    """Calls Gemini Flash with automatic model fallback."""
     last_err = None
     for model_name in MODEL_CANDIDATES:
         try:
@@ -59,15 +70,12 @@ def call_gemini(contents):
 
 def clean_latex_to_unicode(text: str) -> str:
     """Strips raw LaTeX ($...$, \\text{}, \\sigma, subscripts/superscripts) into clean Unicode."""
-    # 1. Remove $$ and $ math delimiters
     text = re.sub(r'\$\$(.*?)\$\$', r'\1', text, flags=re.DOTALL)
     text = re.sub(r'\$(.*?)\$', r'\1', text)
 
-    # 2. Strip \text{...}, \mathrm{...}, \mathbf{...} wrappers (run multiple times for nested tags)
     for _ in range(4):
         text = re.sub(r'\\(?:text|mathrm|mathbf|mathit|textbf|mathcal)\{([^}]*)\}', r'\1', text)
 
-    # 3. Replace LaTeX Greek letters, arrows, and math symbols with clean Unicode
     latex_symbols = {
         r'\sigma^*': 'σ*', r'\pi^*': 'π*',
         r'\sigma': 'σ', r'\pi': 'π', r'\Delta': 'Δ', r'\delta': 'δ',
@@ -83,37 +91,17 @@ def clean_latex_to_unicode(text: str) -> str:
     for k, v in latex_symbols.items():
         text = text.replace(k, v)
 
-    # 4. Convert Superscripts: ^{2+}, ^2, ^*
     sup_map = str.maketrans("0123456789+-=()nxyz*", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿˣʸᶻ*")
-    text = re.sub(
-        r'\^\{([^}]+)\}',
-        lambda m: m.group(1).translate(sup_map),
-        text
-    )
-    text = re.sub(
-        r'\^([0-9+\-=*])',
-        lambda m: m.group(1).translate(sup_map),
-        text
-    )
+    text = re.sub(r'\^\{([^}]+)\}', lambda m: m.group(1).translate(sup_map), text)
+    text = re.sub(r'\^([0-9+\-=*])', lambda m: m.group(1).translate(sup_map), text)
 
-    # 5. Convert Subscripts: _{2p_x}, _{1s}, _2
     sub_map = str.maketrans("0123456789+-=()aeioruvxspyz", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑᵢₒᵣᵤᵥₓₛₚᵧ₂")
-    text = re.sub(
-        r'_\{([^}]+)\}',
-        lambda m: m.group(1).replace('_', '').translate(sub_map),
-        text
-    )
-    text = re.sub(
-        r'_([0-9a-zA-Z])',
-        lambda m: m.group(1).translate(sub_map),
-        text
-    )
+    text = re.sub(r'_\{([^}]+)\}', lambda m: m.group(1).replace('_', '').translate(sub_map), text)
+    text = re.sub(r'_([0-9a-zA-Z])', lambda m: m.group(1).translate(sub_map), text)
 
-    # 6. Turn Markdown checkboxes "- [ ]" into nice ballot boxes "☐"
     text = re.sub(r'^\s*[\*\-]\s*\[\s*\]\s*', '• ☐ ', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*[\*\-]\s*\[x\]\s*', '• ☑ ', text, flags=re.MULTILINE | re.IGNORECASE)
 
-    # 7. Clean up leftover LaTeX spacing/braces
     text = text.replace(r'\,', ' ').replace(r'\;', ' ').replace(r'\{', '{').replace(r'\}', '}')
     return text
 
@@ -141,20 +129,72 @@ def extract_video_id(url: str) -> str | None:
     return None
 
 
-def get_video_metadata(url: str) -> dict:
-    """Extracts video title and description using yt-dlp without downloading the video."""
-    ydl_opts = {'quiet': True, 'skip_download': True, 'no_warnings': True}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        return {
-            'title': info.get('title', 'Lecture_Notes'),
-            'description': info.get('description', ''),
-        }
+def get_video_metadata(video_id: str) -> dict:
+    """
+    Cloud-proof metadata fetcher!
+    1. Scrapes ytInitialPlayerResponse from raw HTML (bypasses yt-dlp bot check on Render).
+    2. Falls back to Piped/Invidious public APIs + YouTube oEmbed API.
+    3. Never crashes even if datacenter IP is rate-limited.
+    """
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    title = None
+    description = ""
+
+    # Method 1: Direct HTML parse of ytInitialPlayerResponse (works on cloud IPs without cookies)
+    try:
+        r = requests.get(watch_url, headers=BROWSER_HEADERS, cookies={"CONSENT": "YES+cb"}, timeout=12)
+        if r.status_code == 200:
+            match = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.+?\});', r.text)
+            if match:
+                data = json.loads(match.group(1))
+                vd = data.get("videoDetails", {})
+                title = vd.get("title")
+                description = vd.get("shortDescription", "")
+            if not description:
+                desc_match = re.search(r'"shortDescription":"((?:\\.|[^"\\])*)"', r.text)
+                if desc_match:
+                    description = bytes(desc_match.group(1), "utf-8").decode("unicode_escape")
+            if not title:
+                title_match = re.search(r'<title>(.*?)\s*-\s*YouTube</title>', r.text)
+                if title_match:
+                    title = title_match.group(1)
+    except Exception:
+        pass
+
+    # Method 2: Piped Public API fallback (if description was still empty)
+    if not description:
+        for api_base in ["https://pipedapi.kavin.rocks", "https://pipedapi.tokhmi.xyz"]:
+            try:
+                r = requests.get(f"{api_base}/streams/{video_id}", timeout=8)
+                if r.status_code == 200:
+                    d = r.json()
+                    title = title or d.get("title")
+                    description = d.get("description", "")
+                    if description:
+                        break
+            except Exception:
+                pass
+
+    # Method 3: Official YouTube oEmbed API for Title (100% never blocked)
+    if not title:
+        try:
+            r = requests.get(f"https://www.youtube.com/oembed?url={watch_url}&format=json", timeout=8)
+            if r.status_code == 200:
+                title = r.json().get("title")
+        except Exception:
+            pass
+
+    return {
+        "title": title or f"YouTube_Lecture_{video_id}",
+        "description": description or "",
+    }
 
 
 def extract_resource_links(description: str) -> dict:
     """Finds PDFs, Google Drive/Docs links, and unshortens bit.ly/tinyurl links."""
-    urls = re.findall(r'(https?://[^\s\)\]\>\"\'<]+)', description)
+    # Also strip HTML tags in case description came from Piped API
+    clean_desc = re.sub(r'<[^>]+>', ' ', description)
+    urls = re.findall(r'(https?://[^\s\)\]\>\"\'<]+)', clean_desc)
     drive_links, direct_pdfs, other_links = [], [], []
     ignore_domains = (
         'youtube.com', 'youtu.be', 'instagram.com', 'twitter.com',
@@ -169,7 +209,6 @@ def extract_resource_links(description: str) -> dict:
         if any(domain in lower_url for domain in ignore_domains):
             continue
 
-        # Unshorten bit.ly / tinyurl links to check if they point to Drive or a PDF
         if any(short in lower_url for short in shorteners):
             try:
                 resp = requests.head(clean_url, allow_redirects=True, timeout=5)
@@ -189,8 +228,9 @@ def extract_resource_links(description: str) -> dict:
     return {'drive': drive_links, 'pdfs': direct_pdfs, 'other': other_links}
 
 
-def fetch_transcript(video_id: str) -> str:
-    """Fetches the transcript (compatible with youtube-transcript-api v1.0+ and yt-dlp fallback)."""
+def fetch_transcript(video_id: str) -> str | None:
+    """Tries to fetch transcript; returns None instead of crashing if datacenter IP is blocked."""
+    # 1. Try youtube-transcript-api
     try:
         ytt_api = YouTubeTranscriptApi()
         if hasattr(ytt_api, 'fetch'):
@@ -202,48 +242,72 @@ def fetch_transcript(video_id: str) -> str:
         else:
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-IN', 'hi'])
             return " ".join([entry['text'] for entry in transcript_list])
+    except Exception:
+        pass
 
-    except Exception as primary_err:
-        # Fallback: Extract auto-subtitles directly via yt-dlp
+    # 2. Try Piped API subtitles (bypasses datacenter blocks)
+    for api_base in ["https://pipedapi.kavin.rocks", "https://pipedapi.tokhmi.xyz"]:
+        try:
+            r = requests.get(f"{api_base}/streams/{video_id}", timeout=8)
+            if r.status_code == 200:
+                subtitles = r.json().get("subtitles", [])
+                for sub in subtitles:
+                    if sub.get("code", "").startswith(("en", "hi")) and sub.get("url"):
+                        sub_text = requests.get(sub["url"], timeout=8).text
+                        clean_lines = [
+                            line for line in sub_text.splitlines()
+                            if line.strip() and not line.startswith(("WEBVTT", "Kind:", "Language:"))
+                            and "-->" not in line and not line.strip().isdigit()
+                        ]
+                        joined = re.sub(r'<[^>]+>', '', " ".join(clean_lines))
+                        if len(joined) > 100:
+                            return joined
+        except Exception:
+            pass
+
+    # 3. Try yt-dlp if cookies.txt is available
+    if COOKIES_PATH:
         try:
             url = f"https://www.youtube.com/watch?v={video_id}"
-            ydl_opts = {'quiet': True, 'skip_download': True, 'no_warnings': True}
+            ydl_opts = {'quiet': True, 'skip_download': True, 'no_warnings': True, 'cookiefile': COOKIES_PATH}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 subs = info.get('subtitles') or info.get('automatic_captions') or {}
-
                 for lang in ['en', 'en-IN', 'hi']:
                     if lang in subs:
                         for fmt in subs[lang]:
                             if fmt.get('ext') == 'json3':
-                                r = requests.get(fmt['url'], timeout=15)
-                                data = r.json()
-                                words = []
-                                for event in data.get('events', []):
-                                    for seg in event.get('segs', []):
-                                        if 'utf8' in seg:
-                                            words.append(seg['utf8'])
+                                data = requests.get(fmt['url'], timeout=15).json()
+                                words = [
+                                    seg['utf8']
+                                    for event in data.get('events', [])
+                                    for seg in event.get('segs', [])
+                                    if 'utf8' in seg
+                                ]
                                 text = "".join(words).replace("\n", " ")
                                 if text.strip():
                                     return text
         except Exception:
             pass
-        raise RuntimeError(f"Could not fetch transcript: {primary_err}")
+
+    # Return None so Gemini can use its native YouTube URL ingestion!
+    return None
 
 
-def generate_study_notes(title: str, transcript: str, description: str) -> str:
-    """Uses Gemini 3.8 Flash to turn raw transcript into structured, Unicode-clean study notes."""
-    prompt = f"""
+def generate_study_notes(video_id: str, title: str, transcript: str | None, description: str) -> str:
+    """
+    Generates study notes.
+    If transcript was fetched, passes the text.
+    If YouTube blocked the cloud IP from fetching the transcript, passes the YouTube URL
+    directly to Gemini via Google's internal FileData URI so Gemini watches the video directly!
+    """
+    base_instructions = f"""
     You are an expert academic note-taker. Create comprehensive, well-structured, 
-    easy-to-read study notes from the following lecture video.
+    easy-to-read study notes from this lecture video.
     
     Video Title: {title}
-    
     Video Description (for context/topics):
     {description[:1500]}
-    
-    Lecture Transcript:
-    {transcript}
     
     STRICT FORMATTING RULES:
     - DO NOT use LaTeX math mode ($...$ or $$...$$) or commands like \\text{{}}, \\sigma, \\rightarrow, \\ge.
@@ -259,9 +323,20 @@ def generate_study_notes(title: str, transcript: str, description: str) -> str:
     4. ## Important Examples / Exceptions / Edge Cases Discussed
     5. ## Quick Revision Checklist (Use ☐ checkboxes)
     
-    Note: If the transcript is in Hinglish or Hindi, translate and write all the final notes cleanly in English.
+    Note: If the lecture is in Hinglish or Hindi, translate and write all the final notes cleanly in English.
     """
-    response = call_gemini(prompt)
+
+    if transcript:
+        prompt = f"{base_instructions}\n\nLecture Transcript:\n{transcript}"
+        response = call_gemini(prompt)
+    else:
+        # Cloud IP Bypass: Let Google's servers ingest the YouTube video directly!
+        youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+        response = call_gemini([
+            types.Part.from_uri(file_uri=youtube_url, mime_type="video/mp4"),
+            base_instructions
+        ])
+
     return clean_latex_to_unicode(response.text)
 
 
@@ -289,7 +364,7 @@ def answer_text_question(question: str, lecture_data: dict, chat_history: list) 
     {lecture_data['notes']}
 
     Full Lecture Transcript (reference):
-    {lecture_data['transcript'][:60000]}
+    {(lecture_data.get('transcript') or '')[:60000]}
 
     Recent Q&A History:
     {history_str}
@@ -312,7 +387,7 @@ def answer_voice_question(audio_bytes: bytes, lecture_data: dict) -> str:
     Generated Notes:
     {lecture_data['notes']}
     Full Lecture Transcript:
-    {lecture_data['transcript'][:60000]}
+    {(lecture_data.get('transcript') or '')[:60000]}
     """
     response = call_gemini([
         types.Part.from_bytes(data=audio_bytes, mime_type='audio/ogg'),
@@ -363,8 +438,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if video_id:
         status_msg = await update.message.reply_text("🔍 Scanning video description & unshortening links...")
         try:
-            # 1. Fetch Metadata & Description Links
-            metadata = await asyncio.to_thread(get_video_metadata, text)
+            # 1. Fetch Metadata & Description Links (Cloud-safe!)
+            metadata = await asyncio.to_thread(get_video_metadata, video_id)
             title = metadata['title']
             description = metadata['description']
             links = await asyncio.to_thread(extract_resource_links, description)
@@ -397,15 +472,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                         )
                     os.remove(filepath)
 
-            # 3. Fetch Transcript & Generate Notes
-            notes_status = await update.message.reply_text("📝 Fetching transcript & compiling your PDF study notes...")
+            # 3. Fetch Transcript (or fallback to Gemini direct YouTube ingestion) & Generate Notes
+            notes_status = await update.message.reply_text("📝 Analyzing lecture & compiling your PDF study notes...")
             transcript = await asyncio.to_thread(fetch_transcript, video_id)
-            notes = await asyncio.to_thread(generate_study_notes, title, transcript, description)
+            notes = await asyncio.to_thread(generate_study_notes, video_id, title, transcript, description)
 
             # Save lecture context in memory for follow-up Q&A
             context.user_data['lecture'] = {
                 'title': title,
-                'transcript': transcript,
+                'transcript': transcript or notes,
                 'notes': notes
             }
             context.user_data['qa_history'] = []
@@ -491,7 +566,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Study Bot is alive and running 24/7!")
 
     def log_message(self, format, *args):
-        pass  # Silences HTTP logs so your console stays clean
+        pass
 
 
 def start_keep_alive_server():
@@ -501,7 +576,6 @@ def start_keep_alive_server():
 
 
 def main():
-    # Starts background web server so Render/UptimeRobot can keep the bot awake 24/7
     threading.Thread(target=start_keep_alive_server, daemon=True).start()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -510,7 +584,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
 
-    print("🚀 Study Bot is running 24/7! Press Ctrl+C to stop.")
+    print("🚀 Cloud-Proof Study Bot is running 24/7!")
     app.run_polling(drop_pending_updates=True)
 
 
