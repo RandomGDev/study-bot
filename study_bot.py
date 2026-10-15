@@ -31,12 +31,34 @@ client = genai.Client(
     http_options=types.HttpOptions(timeout=180000)
 )
 
-# Includes Flash and Flash-Lite models so if one is experiencing 503 high demand, it falls back seamlessly
+# Priority list for full Lecture Note Generation (Flagship 3.8 -> 3.7 -> 3.6 -> 500-RPD Flash-Lite models)
 MODEL_CANDIDATES = [
-    "Gemini 3.8 Flash",
-    "Gemini 3.1 Flash-Lite",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash-lite-preview",
+    "gemini-3.1-flash-lite",
     "gemini-3.1-flash-lite-preview",
-    "Gemini 2.5 Flash",
+    "gemini-3.0-flash",
+    "gemini-3-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+]
+
+# Priority list for Voice & Text Q&A (Uses high-RPM 500/day models first so Q&A is instant even right after making a PDF!)
+QA_MODEL_CANDIDATES = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.0-flash",
+    "gemini-3-flash",
+    "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
 ]
 
@@ -60,16 +82,17 @@ BROWSER_HEADERS = {
 
 # --- HELPER FUNCTIONS ---
 
-def call_gemini(contents, low_res_video: bool = False):
+def call_gemini(contents, low_res_video: bool = False, models_list: list | None = None):
     """
-    Calls Gemini with automatic 503/429 retry backoff and model fallback.
-    If gemini-3.0-flash has a 503 demand spike, it retries and falls back automatically!
+    Calls Gemini with automatic model rotation across all your active AI Studio models.
+    Immediately hops to the next model on 404, 429 (rate limit), or 503 (high demand).
     """
+    candidates = models_list or MODEL_CANDIDATES
     last_err = None
     config = types.GenerateContentConfig(media_resolution="MEDIA_RESOLUTION_LOW") if low_res_video else None
 
-    for attempt in range(3):  # Up to 3 full passes with backoff
-        for model_name in MODEL_CANDIDATES:
+    for attempt in range(2):
+        for model_name in candidates:
             try:
                 return client.models.generate_content(
                     model=model_name,
@@ -79,15 +102,12 @@ def call_gemini(contents, low_res_video: bool = False):
             except Exception as e:
                 last_err = e
                 err_str = str(e)
-                # If model name doesn't exist on this account, try next model immediately
-                if "404" in err_str or "NOT_FOUND" in err_str or "no longer available" in err_str:
-                    continue
-                # If 503 High Demand or 429 Rate Limit, pause briefly and try next/retry
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    time.sleep(4 * (attempt + 1))
+                # Hop immediately to the next model in your priority list without long blocking sleeps
+                if any(code in err_str for code in ("404", "NOT_FOUND", "no longer available", "429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE")):
+                    time.sleep(0.5)
                     continue
                 raise e
-        time.sleep(5)
+        time.sleep(2)
     raise last_err
 
 
@@ -314,7 +334,6 @@ def _parse_caption_track_url(base_url: str) -> str | None:
 
 def fetch_transcript(video_id: str) -> str | None:
     """Fast, cloud-proof transcript fetcher."""
-    # Layer 1: Innertube Embedded/VR Player API (rarely blocked on cloud IPs)
     player_data = _query_youtube_innertube(video_id)
     tracks = (
         player_data.get("captions", {})
@@ -332,7 +351,6 @@ def fetch_transcript(video_id: str) -> str | None:
                 if text:
                     return text
 
-    # Layer 2: Scrape captionTracks from raw watch page HTML
     try:
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
         r = requests.get(watch_url, headers=BROWSER_HEADERS, cookies={"CONSENT": "YES+cb"}, timeout=10)
@@ -348,7 +366,6 @@ def fetch_transcript(video_id: str) -> str | None:
     except Exception:
         pass
 
-    # Layer 3: youtube-transcript-api
     try:
         ytt_api = YouTubeTranscriptApi()
         if hasattr(ytt_api, 'fetch'):
@@ -360,35 +377,11 @@ def fetch_transcript(video_id: str) -> str | None:
     except Exception:
         pass
 
-    # Layer 4: Invidious public instances
-    for inv_base in ["https://inv.tux.pizza", "https://invidious.nerdvpn.de", "https://iv.ggtyler.dev"]:
-        try:
-            r = requests.get(f"{inv_base}/api/v1/captions/{video_id}", timeout=6)
-            if r.status_code == 200:
-                captions = r.json().get("captions", [])
-                for cap in captions:
-                    if cap.get("language_code", "").startswith(("en", "hi")) and cap.get("url"):
-                        vtt = requests.get(f"{inv_base}{cap['url']}", timeout=8).text
-                        lines = [
-                            l for l in vtt.splitlines()
-                            if l.strip() and "-->" not in l and not l.startswith(("WEBVTT", "Kind:", "Language:"))
-                        ]
-                        joined = re.sub(r'<[^>]+>', '', " ".join(lines))
-                        if len(joined) > 100:
-                            return joined
-        except Exception:
-            pass
-
     return None
 
 
 def generate_study_notes(video_id: str, title: str, transcript: str | None, description: str) -> str:
-    """
-    Generates study notes within the Free Tier 250,000 TPM rate limit!
-    - If transcript is available: caps at 700,000 chars (~175K tokens, safely under 250K TPM).
-    - If raw video fallback is needed: uses fps=0.1 and a 90-minute window (~120K tokens)
-      so it NEVER exceeds the 250K TPM Free Tier limit or triggers 503 overload!
-    """
+    """Generates structured study notes within the 250K TPM Free Tier limit."""
     base_instructions = f"""
     You are an expert academic note-taker. Create comprehensive, well-structured, 
     easy-to-read study notes from this lecture video.
@@ -415,14 +408,12 @@ def generate_study_notes(video_id: str, title: str, transcript: str | None, desc
     """
 
     if transcript:
-        # 700,000 characters is ~175,000 tokens — safely below the 250,000 TPM Free Tier limit!
         safe_transcript = transcript[:700000]
         prompt = f"{base_instructions}\n\nLecture Transcript:\n{safe_transcript}"
-        response = call_gemini(prompt, low_res_video=False)
+        response = call_gemini(prompt, low_res_video=False, models_list=MODEL_CANDIDATES)
     else:
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
         try:
-            # Cap at 5400s (90 mins) and fps=0.1 so total tokens stay ~110K (well under 250K Free Tier TPM!)
             response = call_gemini(
                 [
                     types.Part(
@@ -431,10 +422,10 @@ def generate_study_notes(video_id: str, title: str, transcript: str | None, desc
                     ),
                     base_instructions
                 ],
-                low_res_video=True
+                low_res_video=True,
+                models_list=MODEL_CANDIDATES
             )
         except Exception:
-            # Ultra-light fallback (first 45 mins at 0.1 FPS = ~55K tokens) if Google video servers are overloaded
             response = call_gemini(
                 [
                     types.Part(
@@ -443,7 +434,8 @@ def generate_study_notes(video_id: str, title: str, transcript: str | None, desc
                     ),
                     base_instructions
                 ],
-                low_res_video=True
+                low_res_video=True,
+                models_list=MODEL_CANDIDATES
             )
 
     return clean_latex_to_unicode(response.text)
@@ -460,7 +452,7 @@ def create_notes_pdf(title: str, markdown_notes: str, output_path: str) -> str:
 
 
 def answer_text_question(question: str, lecture_data: dict, chat_history: list) -> str:
-    """Answers a follow-up text question using the lecture transcript and generated notes."""
+    """Answers a follow-up text question using fast, high-quota Q&A models."""
     history_str = "\n".join([f"Q: {q}\nA: {a}" for q, a in chat_history[-4:]])
     prompt = f"""
     You are a helpful study assistant. Answer the student's question clearly and concisely 
@@ -472,20 +464,20 @@ def answer_text_question(question: str, lecture_data: dict, chat_history: list) 
     Generated Notes:
     {lecture_data['notes']}
 
-    Full Lecture Transcript (reference):
-    {(lecture_data.get('transcript') or '')[:60000]}
+    Additional Lecture Reference:
+    {(lecture_data.get('transcript') or '')[:15000]}
 
     Recent Q&A History:
     {history_str}
 
     Student's Question: {question}
     """
-    response = call_gemini(prompt)
+    response = call_gemini(prompt, models_list=QA_MODEL_CANDIDATES)
     return clean_latex_to_unicode(response.text)
 
 
-def answer_voice_question(audio_bytes: bytes, lecture_data: dict) -> str:
-    """Answers a voice note question directly using Gemini's multimodal audio support."""
+def answer_voice_question(audio_bytes: bytes, mime_type: str, lecture_data: dict) -> str:
+    """Answers a voice note question rapidly using high-RPM multimodal Flash models."""
     prompt = f"""
     Listen to the student's voice note question and answer it clearly and concisely based on 
     this lecture. First write a 1-line transcription of what she asked (e.g., '🎤 You asked: ...'), 
@@ -495,13 +487,16 @@ def answer_voice_question(audio_bytes: bytes, lecture_data: dict) -> str:
     Lecture Title: {lecture_data['title']}
     Generated Notes:
     {lecture_data['notes']}
-    Full Lecture Transcript:
-    {(lecture_data.get('transcript') or '')[:60000]}
+    Additional Lecture Reference:
+    {(lecture_data.get('transcript') or '')[:15000]}
     """
-    response = call_gemini([
-        types.Part.from_bytes(data=audio_bytes, mime_type='audio/ogg'),
-        prompt
-    ])
+    response = call_gemini(
+        [
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+            prompt
+        ],
+        models_list=QA_MODEL_CANDIDATES
+    )
     return clean_latex_to_unicode(response.text)
 
 
@@ -547,7 +542,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if video_id:
         status_msg = await update.message.reply_text("🔍 Scanning video description & unshortening links...")
         try:
-            # 1. Fetch Metadata & Description Links
             metadata = await asyncio.to_thread(get_video_metadata, video_id)
             title = metadata['title']
             description = metadata['description']
@@ -570,7 +564,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             await status_msg.edit_text(links_msg, disable_web_page_preview=True)
 
-            # 2. Try Auto-Downloading Direct PDFs / Single Drive Files
             for file_url in (links['pdfs'] + links['drive'])[:3]:
                 filepath = await asyncio.to_thread(download_file_if_possible, file_url)
                 if filepath and os.path.exists(filepath):
@@ -581,7 +574,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                         )
                     os.remove(filepath)
 
-            # 3. Live Step-by-Step Progress Updates
             notes_status = await update.message.reply_text("⏳ Step 1/3: Checking lecture transcript...")
             transcript = await asyncio.to_thread(fetch_transcript, video_id)
 
@@ -595,7 +587,6 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 timeout=180.0
             )
 
-            # Save lecture context in memory for follow-up Q&A
             context.user_data['lecture'] = {
                 'title': title,
                 'transcript': transcript or notes,
@@ -603,20 +594,20 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             }
             context.user_data['qa_history'] = []
 
-            # 4. Generate Styled PDF File
             await notes_status.edit_text("📄 Step 3/3: Compiling formatted PDF file...")
             safe_title = re.sub(r'[^\w\-_]', '_', title)[:40]
             pdf_filename = f"{safe_title}_Notes.pdf"
             await asyncio.to_thread(create_notes_pdf, title, notes, pdf_filename)
 
-            await notes_status.delete()
+            try:
+                await notes_status.delete()
+            except Exception:
+                pass
 
-            # Send clean, readable text in Telegram chat
             chat_friendly_notes = format_for_telegram_chat(notes)
             for i in range(0, len(chat_friendly_notes), 4000):
                 await update.message.reply_text(chat_friendly_notes[i:i+4000])
 
-            # Send the compiled PDF
             with open(pdf_filename, "rb") as f:
                 await update.message.reply_document(
                     document=f,
@@ -647,35 +638,50 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data['qa_history'] = qa_history
 
         clean_answer = format_for_telegram_chat(answer)
-        await thinking_msg.delete()
+        try:
+            await thinking_msg.delete()
+        except Exception:
+            pass
         for i in range(0, len(clean_answer), 4000):
             await update.message.reply_text(clean_answer[i:i+4000])
 
     except Exception as e:
-        await thinking_msg.edit_text(f"⚠️ Couldn't process your question: {str(e)}")
+        await update.message.reply_text(f"⚠️ Couldn't process your question: {str(e)}")
 
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allows her to ask doubts via Telegram Voice Notes without typing."""
+    """Handles both Telegram Voice Notes and Audio files with extended network timeouts."""
     if 'lecture' not in context.user_data:
         await update.message.reply_text("🎥 Send me a YouTube lecture link first before asking voice questions!")
         return
 
     thinking_msg = await update.message.reply_text("🎧 Listening to your question...")
     try:
-        voice_file = await update.message.voice.get_file()
-        audio_bytes = await voice_file.download_as_bytearray()
+        media_obj = update.message.voice or update.message.audio
+        mime_type = getattr(media_obj, "mime_type", None) or "audio/ogg"
+
+        # Extended 60s timeout so Telegram file downloads on Render never throw TimedOut
+        voice_file = await media_obj.get_file(read_timeout=60, write_timeout=60, connect_timeout=30)
+        audio_bytes = await voice_file.download_as_bytearray(read_timeout=60, write_timeout=60, connect_timeout=30)
 
         lecture_data = context.user_data['lecture']
-        answer = await asyncio.to_thread(answer_voice_question, bytes(audio_bytes), lecture_data)
+        answer = await asyncio.to_thread(
+            answer_voice_question,
+            bytes(audio_bytes),
+            mime_type,
+            lecture_data
+        )
 
         clean_answer = format_for_telegram_chat(answer)
-        await thinking_msg.delete()
+        try:
+            await thinking_msg.delete()
+        except Exception:
+            pass
         for i in range(0, len(clean_answer), 4000):
             await update.message.reply_text(clean_answer[i:i+4000])
 
     except Exception as e:
-        await thinking_msg.edit_text(f"⚠️ Couldn't process voice note: {str(e)}")
+        await update.message.reply_text(f"⚠️ Couldn't process voice note: {str(e)}")
 
 
 # --- 24/7 KEEP-ALIVE SERVER (FOR CLOUD HOSTING) ---
@@ -699,11 +705,20 @@ def start_keep_alive_server():
 def main():
     threading.Thread(target=start_keep_alive_server, daemon=True).start()
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Increased Telegram HTTP timeouts (60s) so large PDFs and Voice Notes never say "Timed out"
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(30)
+        .pool_timeout(30)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice_message))
 
     print("🚀 Cloud-Proof Study Bot is running 24/7!")
     app.run_polling(drop_pending_updates=True)
