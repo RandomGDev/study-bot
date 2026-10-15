@@ -33,10 +33,10 @@ client = genai.Client(
 
 # Includes Flash and Flash-Lite models so if one is experiencing 503 high demand, it falls back seamlessly
 MODEL_CANDIDATES = [
-    "gemini-3.0-flash",
-    "gemini-3-flash-preview",
+    "Gemini 3.8 Flash",
+    "Gemini 3.1 Flash-Lite",
     "gemini-3.1-flash-lite-preview",
-    "gemini-2.5-flash",
+    "Gemini 2.5 Flash",
     "gemini-2.5-flash-lite",
 ]
 
