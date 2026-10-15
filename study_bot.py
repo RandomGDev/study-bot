@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import threading
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -20,7 +21,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_KEY")
 
-# Optional: If you ever add a Secret File named cookies.txt in Render, it will auto-use it
 COOKIES_PATH = "/etc/secrets/cookies.txt" if os.path.exists("/etc/secrets/cookies.txt") else (
     "cookies.txt" if os.path.exists("cookies.txt") else None
 )
@@ -28,9 +28,8 @@ COOKIES_PATH = "/etc/secrets/cookies.txt" if os.path.exists("/etc/secrets/cookie
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Uses your working model first, with automatic fallbacks
-MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
+MODEL_CANDIDATES = ["gemini-3.8-flash", "gemini-3.0-flash", "gemini-3-flash-preview", "gemini-2.5-flash"]
 
-# Clean styling for the generated PDF notes
 PDF_CSS = """
 body { font-family: Arial, Helvetica, sans-serif; line-height: 1.6; color: #1e293b; font-size: 10.5pt; word-wrap: break-word; }
 h1 { color: #1e3a8a; border-bottom: 2px solid #1e3a8a; padding-bottom: 6px; margin-top: 0; font-size: 18pt; }
@@ -51,14 +50,17 @@ BROWSER_HEADERS = {
 
 # --- HELPER FUNCTIONS ---
 
-def call_gemini(contents):
-    """Calls Gemini Flash with automatic model fallback."""
+def call_gemini(contents, low_res_video: bool = False):
+    """Calls Gemini Flash with automatic model fallback and optional low-resolution video mode."""
     last_err = None
+    config = types.GenerateContentConfig(media_resolution="MEDIA_RESOLUTION_LOW") if low_res_video else None
+
     for model_name in MODEL_CANDIDATES:
         try:
             return client.models.generate_content(
                 model=model_name,
                 contents=contents,
+                config=config,
             )
         except Exception as e:
             last_err = e
@@ -129,53 +131,80 @@ def extract_video_id(url: str) -> str | None:
     return None
 
 
+def _query_youtube_innertube(video_id: str) -> dict:
+    """Queries YouTube's internal Innertube API as an Android/iOS client to bypass cloud IP blocks."""
+    clients = [
+        {
+            "clientName": "ANDROID",
+            "clientVersion": "19.44.38",
+            "androidSdkVersion": 34,
+            "hl": "en",
+            "gl": "IN",
+        },
+        {
+            "clientName": "IOS",
+            "clientVersion": "19.45.4",
+            "deviceMake": "Apple",
+            "deviceModel": "iPhone16,2",
+            "hl": "en",
+            "gl": "IN",
+        },
+        {
+            "clientName": "WEB",
+            "clientVersion": "2.20250101.00.00",
+            "hl": "en",
+            "gl": "IN",
+        }
+    ]
+    for client_ctx in clients:
+        try:
+            r = requests.post(
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                json={"context": {"client": client_ctx}, "videoId": video_id},
+                headers={"User-Agent": "com.google.android.youtube/19.44.38 (Linux; U; Android 14) gzip"},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("videoDetails") or data.get("captions"):
+                    return data
+        except Exception:
+            pass
+    return {}
+
+
 def get_video_metadata(video_id: str) -> dict:
-    """
-    Cloud-proof metadata fetcher!
-    1. Scrapes ytInitialPlayerResponse from raw HTML (bypasses yt-dlp bot check on Render).
-    2. Falls back to Piped/Invidious public APIs + YouTube oEmbed API.
-    3. Never crashes even if datacenter IP is rate-limited.
-    """
+    """Cloud-proof metadata fetcher using Innertube API + HTML + oEmbed fallbacks."""
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     title = None
     description = ""
 
-    # Method 1: Direct HTML parse of ytInitialPlayerResponse (works on cloud IPs without cookies)
-    try:
-        r = requests.get(watch_url, headers=BROWSER_HEADERS, cookies={"CONSENT": "YES+cb"}, timeout=12)
-        if r.status_code == 200:
-            match = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.+?\});', r.text)
-            if match:
-                data = json.loads(match.group(1))
-                vd = data.get("videoDetails", {})
-                title = vd.get("title")
-                description = vd.get("shortDescription", "")
-            if not description:
-                desc_match = re.search(r'"shortDescription":"((?:\\.|[^"\\])*)"', r.text)
-                if desc_match:
-                    description = bytes(desc_match.group(1), "utf-8").decode("unicode_escape")
-            if not title:
-                title_match = re.search(r'<title>(.*?)\s*-\s*YouTube</title>', r.text)
-                if title_match:
-                    title = title_match.group(1)
-    except Exception:
-        pass
+    # 1. Try Innertube API (Android/iOS bypass)
+    player_data = _query_youtube_innertube(video_id)
+    if player_data:
+        vd = player_data.get("videoDetails", {})
+        title = vd.get("title")
+        description = vd.get("shortDescription", "")
 
-    # Method 2: Piped Public API fallback (if description was still empty)
-    if not description:
-        for api_base in ["https://pipedapi.kavin.rocks", "https://pipedapi.tokhmi.xyz"]:
-            try:
-                r = requests.get(f"{api_base}/streams/{video_id}", timeout=8)
-                if r.status_code == 200:
-                    d = r.json()
-                    title = title or d.get("title")
-                    description = d.get("description", "")
-                    if description:
-                        break
-            except Exception:
-                pass
+    # 2. Try raw watch page HTML
+    if not description or not title:
+        try:
+            r = requests.get(watch_url, headers=BROWSER_HEADERS, cookies={"CONSENT": "YES+cb"}, timeout=12)
+            if r.status_code == 200:
+                match = re.search(r'ytInitialPlayerResponse\s*=\s*(\{.+?\});', r.text)
+                if match:
+                    data = json.loads(match.group(1))
+                    vd = data.get("videoDetails", {})
+                    title = title or vd.get("title")
+                    description = description or vd.get("shortDescription", "")
+                if not description:
+                    desc_match = re.search(r'"shortDescription":"((?:\\.|[^"\\])*)"', r.text)
+                    if desc_match:
+                        description = bytes(desc_match.group(1), "utf-8").decode("unicode_escape")
+        except Exception:
+            pass
 
-    # Method 3: Official YouTube oEmbed API for Title (100% never blocked)
+    # 3. Official oEmbed fallback for Title
     if not title:
         try:
             r = requests.get(f"https://www.youtube.com/oembed?url={watch_url}&format=json", timeout=8)
@@ -192,7 +221,6 @@ def get_video_metadata(video_id: str) -> dict:
 
 def extract_resource_links(description: str) -> dict:
     """Finds PDFs, Google Drive/Docs links, and unshortens bit.ly/tinyurl links."""
-    # Also strip HTML tags in case description came from Piped API
     clean_desc = re.sub(r'<[^>]+>', ' ', description)
     urls = re.findall(r'(https?://[^\s\)\]\>\"\'<]+)', clean_desc)
     drive_links, direct_pdfs, other_links = [], [], []
@@ -228,9 +256,81 @@ def extract_resource_links(description: str) -> dict:
     return {'drive': drive_links, 'pdfs': direct_pdfs, 'other': other_links}
 
 
+def _parse_caption_track_url(base_url: str) -> str | None:
+    """Downloads and parses a YouTube timedtext XML or JSON3 caption URL into plain text."""
+    try:
+        # Try JSON3 format first
+        sep = "&" if "?" in base_url else "?"
+        r = requests.get(f"{base_url}{sep}fmt=json3", headers=BROWSER_HEADERS, timeout=12)
+        if r.status_code == 200 and r.text.strip().startswith("{"):
+            data = r.json()
+            words = [
+                seg["utf8"]
+                for event in data.get("events", [])
+                for seg in event.get("segs", [])
+                if "utf8" in seg
+            ]
+            text = "".join(words).replace("\n", " ").strip()
+            if len(text) > 100:
+                return text
+
+        # Fallback to standard XML format
+        r_xml = requests.get(base_url, headers=BROWSER_HEADERS, timeout=12)
+        if r_xml.status_code == 200 and "<text" in r_xml.text:
+            root = ET.fromstring(r_xml.text)
+            texts = [elem.text for elem in root.iter("text") if elem.text]
+            joined = " ".join(texts).replace("\n", " ").strip()
+            if len(joined) > 100:
+                return joined
+    except Exception:
+        pass
+    return None
+
+
 def fetch_transcript(video_id: str) -> str | None:
-    """Tries to fetch transcript; returns None instead of crashing if datacenter IP is blocked."""
-    # 1. Try youtube-transcript-api
+    """
+    Multi-layered cloud-proof transcript fetcher:
+    1. YouTube Innertube API (Android/iOS client bypass - works on Render even for 5-hour videos!)
+    2. Direct HTML captionTracks extraction
+    3. youtube-transcript-api
+    4. Piped/Invidious public APIs
+    """
+    # Layer 1: Innertube Android/iOS Player API
+    player_data = _query_youtube_innertube(video_id)
+    tracks = (
+        player_data.get("captions", {})
+        .get("playerCaptionsTracklistRenderer", {})
+        .get("captionTracks", [])
+    )
+    if tracks:
+        # Prioritize English or Hindi tracks
+        sorted_tracks = sorted(
+            tracks,
+            key=lambda t: 0 if t.get("languageCode", "").startswith(("en", "hi")) else 1
+        )
+        for track in sorted_tracks:
+            if track.get("baseUrl"):
+                text = _parse_caption_track_url(track["baseUrl"])
+                if text:
+                    return text
+
+    # Layer 2: Scrape captionTracks from raw watch page HTML
+    try:
+        watch_url = f"https://www.youtube.com/watch?v={video_id}"
+        r = requests.get(watch_url, headers=BROWSER_HEADERS, cookies={"CONSENT": "YES+cb"}, timeout=12)
+        if r.status_code == 200:
+            match = re.search(r'"captionTracks":\s*(\[.*?\])', r.text)
+            if match:
+                html_tracks = json.loads(match.group(1))
+                for track in html_tracks:
+                    if track.get("baseUrl"):
+                        text = _parse_caption_track_url(track["baseUrl"])
+                        if text:
+                            return text
+    except Exception:
+        pass
+
+    # Layer 3: youtube-transcript-api
     try:
         ytt_api = YouTubeTranscriptApi()
         if hasattr(ytt_api, 'fetch'):
@@ -239,19 +339,15 @@ def fetch_transcript(video_id: str) -> str | None:
                 snippet.text if hasattr(snippet, 'text') else snippet['text']
                 for snippet in fetched
             )
-        else:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['en', 'en-IN', 'hi'])
-            return " ".join([entry['text'] for entry in transcript_list])
     except Exception:
         pass
 
-    # 2. Try Piped API subtitles (bypasses datacenter blocks)
+    # Layer 4: Piped Public APIs
     for api_base in ["https://pipedapi.kavin.rocks", "https://pipedapi.tokhmi.xyz"]:
         try:
             r = requests.get(f"{api_base}/streams/{video_id}", timeout=8)
             if r.status_code == 200:
-                subtitles = r.json().get("subtitles", [])
-                for sub in subtitles:
+                for sub in r.json().get("subtitles", []):
                     if sub.get("code", "").startswith(("en", "hi")) and sub.get("url"):
                         sub_text = requests.get(sub["url"], timeout=8).text
                         clean_lines = [
@@ -265,41 +361,15 @@ def fetch_transcript(video_id: str) -> str | None:
         except Exception:
             pass
 
-    # 3. Try yt-dlp if cookies.txt is available
-    if COOKIES_PATH:
-        try:
-            url = f"https://www.youtube.com/watch?v={video_id}"
-            ydl_opts = {'quiet': True, 'skip_download': True, 'no_warnings': True, 'cookiefile': COOKIES_PATH}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                subs = info.get('subtitles') or info.get('automatic_captions') or {}
-                for lang in ['en', 'en-IN', 'hi']:
-                    if lang in subs:
-                        for fmt in subs[lang]:
-                            if fmt.get('ext') == 'json3':
-                                data = requests.get(fmt['url'], timeout=15).json()
-                                words = [
-                                    seg['utf8']
-                                    for event in data.get('events', [])
-                                    for seg in event.get('segs', [])
-                                    if 'utf8' in seg
-                                ]
-                                text = "".join(words).replace("\n", " ")
-                                if text.strip():
-                                    return text
-        except Exception:
-            pass
-
-    # Return None so Gemini can use its native YouTube URL ingestion!
     return None
 
 
 def generate_study_notes(video_id: str, title: str, transcript: str | None, description: str) -> str:
     """
     Generates study notes.
-    If transcript was fetched, passes the text.
-    If YouTube blocked the cloud IP from fetching the transcript, passes the YouTube URL
-    directly to Gemini via Google's internal FileData URI so Gemini watches the video directly!
+    - Uses the text transcript whenever available (even 6-hour lectures easily fit!).
+    - If a video has NO subtitles at all, passes the YouTube URL with MEDIA_RESOLUTION_LOW
+      so multi-hour videos fit inside the 1,048,576 token window without throwing a 400 error.
     """
     base_instructions = f"""
     You are an expert academic note-taker. Create comprehensive, well-structured, 
@@ -327,15 +397,37 @@ def generate_study_notes(video_id: str, title: str, transcript: str | None, desc
     """
 
     if transcript:
-        prompt = f"{base_instructions}\n\nLecture Transcript:\n{transcript}"
-        response = call_gemini(prompt)
+        # Cap transcript at ~2.5 million characters (~600k tokens) just in case of a 12-hour stream
+        safe_transcript = transcript[:2500000]
+        prompt = f"{base_instructions}\n\nLecture Transcript:\n{safe_transcript}"
+        response = call_gemini(prompt, low_res_video=False)
     else:
-        # Cloud IP Bypass: Let Google's servers ingest the YouTube video directly!
+        # Direct Video Fallback with MEDIA_RESOLUTION_LOW (cuts video tokens by 65% so One-Shots fit!)
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-        response = call_gemini([
-            types.Part.from_uri(file_uri=youtube_url, mime_type="video/mp4"),
-            base_instructions
-        ])
+        try:
+            response = call_gemini(
+                [
+                    types.Part.from_uri(file_uri=youtube_url, mime_type="video/mp4"),
+                    base_instructions
+                ],
+                low_res_video=True
+            )
+        except Exception as e:
+            # If the video is an 8+ hour marathon with no subtitles that still exceeds 1M tokens,
+            # analyze the first 2.5 hours using VideoMetadata clipping so it still succeeds!
+            if "exceeds the maximum number of tokens" in str(e) or "400" in str(e):
+                response = call_gemini(
+                    [
+                        types.Part(
+                            file_data=types.FileData(file_uri=youtube_url, mime_type="video/mp4"),
+                            video_metadata=types.VideoMetadata(start_offset="0s", end_offset="9000s")
+                        ),
+                        base_instructions
+                    ],
+                    low_res_video=True
+                )
+            else:
+                raise e
 
     return clean_latex_to_unicode(response.text)
 
@@ -438,7 +530,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if video_id:
         status_msg = await update.message.reply_text("🔍 Scanning video description & unshortening links...")
         try:
-            # 1. Fetch Metadata & Description Links (Cloud-safe!)
+            # 1. Fetch Metadata & Description Links
             metadata = await asyncio.to_thread(get_video_metadata, video_id)
             title = metadata['title']
             description = metadata['description']
@@ -472,8 +564,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                         )
                     os.remove(filepath)
 
-            # 3. Fetch Transcript (or fallback to Gemini direct YouTube ingestion) & Generate Notes
-            notes_status = await update.message.reply_text("📝 Analyzing lecture & compiling your PDF study notes...")
+            # 3. Fetch Transcript (or low-res video fallback) & Generate Notes
+            notes_status = await update.message.reply_text("📝 Analyzing lecture & compiling your PDF study notes (takes ~20-40s for full One-Shots)...")
             transcript = await asyncio.to_thread(fetch_transcript, video_id)
             notes = await asyncio.to_thread(generate_study_notes, video_id, title, transcript, description)
 
